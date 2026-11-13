@@ -240,3 +240,14 @@ Static CT chunks the log into “tiles” of 256 entries. If the pool is flushed
 partial-aftersun is a command designed to run as a cronjob which deletes superfluous partial tiles from a local storage backend, freeing up space. It reads the Sunlight config file directly, and has a number of safety measures to avoid deleting the wrong tiles.
 
 The Tuscolo public configs include [an example of how to schedule it with systemd timers](https://config.sunlight.geomys.org/#%2fetc%2fsystemd%2fsystem%2fpartial-aftersun.service).
+
+
+## WRPAC and Custom Certificate Profiles (`allowanyeku`)
+
+When operating a log for specialized testing or ecosystems such as WRPAC (Wallet-Related Party Authentication and Certificate) and custom attribute attestation profiles—where certificates do not strictly adhere to the standard `serverAuth` Extended Key Usage (EKU)—you can configure Sunlight to bypass default EKU restrictions.
+
+To allow submitting certificates with arbitrary or custom EKUs (such as those used in mDL and EUDI wallet-related testing environments), include `allowanyeku: true` in the per-log configuration alongside your custom roots:
+
+```yaml
+    roots: "roots.pem"
+    allowanyeku: true

@@ -130,6 +130,9 @@ type Config struct {
 	// that include a certificate with one of these keys, including the root,
 	// are rejected.
 	BlockedSPKIs [][32]byte
+
+	//WRPAC addition
+	AllowAnyEKU      bool
 }
 
 var ErrLogExists = errors.New("checkpoint already exist, refusing to initialize log")

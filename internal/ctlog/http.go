@@ -149,17 +149,71 @@ func (l *Log) addChainOrPreChain(ctx context.Context, reqBody io.ReadCloser, use
 		return nil, http.StatusBadRequest, fmtErrorf("empty chain")
 	}
 
+    var chain []*x509.Certificate
+    if l.c.AllowAnyEKU {
+	// Saját lánc-parse és validáció AllowAnyEKU esetén, elkerülve a ctfe szigorú EKU ellenőrzését
+	parsedChain := make([]*x509.Certificate, len(req.Chain))
+	for i, der := range req.Chain {
+	    cert, err := x509.ParseCertificate(der)
+	    if err != nil {
+		return nil, http.StatusBadRequest, fmtErrorf("failed to parse certificate %d: %w", i, err)
+	    }
+	    parsedChain[i] = cert
+	}
+	
+	// Időablak ellenőrzés (NotAfterStart / NotAfterLimit)
+	leaf := parsedChain[0]
+	if leaf.NotAfter.Before(l.c.NotAfterStart) || leaf.NotAfter.After(l.c.NotAfterLimit) {
+	    return nil, http.StatusBadRequest, fmtErrorf("certificate validity period outside log limits")
+	}
+
+	// Gyökér és köztes CA pool építése
+	roots := x509.NewCertPool()
+	for _, r := range l.rootPool().RawCertificates() {
+	    roots.AddCert(r)
+	}
+	intermediates := x509.NewCertPool()
+	for _, inter := range parsedChain[1:] {
+	    intermediates.AddCert(inter)
+	}
+
+	opts := x509.VerifyOptions{
+	    Roots:         roots,
+	    Intermediates: intermediates,
+	    CurrentTime:   leaf.NotBefore,
+	    KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}
+
+	// WRPAC -  CT poison masking before  Verify ---
+	ctPoisonOID := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3}
+	leaf.UnhandledCriticalExtensions = slices.DeleteFunc(leaf.UnhandledCriticalExtensions, func(oid asn1.ObjectIdentifier) bool {
+	    return oid.Equal(ctPoisonOID)
+	})
+	// ---------------------------------------------
+
+	if _, err := leaf.Verify(opts); err != nil {
+	    return nil, http.StatusBadRequest, fmtErrorf("invalid chain: %w", err)
+	}
+	chain = parsedChain
+    } else {
+	// Eredeti ctfe validáció standard logokhoz
 	ekus := []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
 	if l.c.MarkCertificates {
-		// The Verified Mark Certificate EKU is not known to the x509 package,
-		// so we can't ask ctfe to check for it. Do it ourselves below.
-		ekus = nil
+	    ekus = nil
 	}
-	chain, err := ctfe.ValidateChain(req.Chain, ctfe.NewCertValidationOpts(l.rootPool(), time.Time{}, false, false, &l.c.NotAfterStart, &l.c.NotAfterLimit, false, ekus))
+	var err error
+	chain, err = ctfe.ValidateChain(req.Chain, ctfe.NewCertValidationOpts(l.rootPool(), time.Time{}, false, false, &l.c.NotAfterStart, &l.c.NotAfterLimit, false, ekus))
 	if err != nil {
-		return nil, http.StatusBadRequest, fmtErrorf("invalid chain: %w", err)
+	    return nil, http.StatusBadRequest, fmtErrorf("invalid chain: %w", err)
 	}
 	if l.c.MarkCertificates && !slices.ContainsFunc(chain[0].UnknownExtKeyUsage, markCertificateEKU.Equal) {
+	    return nil, http.StatusBadRequest, fmtErrorf("invalid chain: missing Verified Mark Certificate EKU")
+	}
+    }
+
+
+	//WRPAC added here to, overriding VMC profile too
+	if !l.c.AllowAnyEKU && l.c.MarkCertificates && !slices.ContainsFunc(chain[0].UnknownExtKeyUsage, markCertificateEKU.Equal) {
 		return nil, http.StatusBadRequest, fmtErrorf("invalid chain: missing Verified Mark Certificate EKU")
 	}
 	lowPriority := lowPriorityLeaf(chain[0])

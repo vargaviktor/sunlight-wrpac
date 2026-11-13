@@ -411,6 +411,11 @@ type LogConfig struct {
 	// NotAfterLimit is the end of the validity range (not included) for
 	// certificates accepted by this log instance, as and RFC 3339 date.
 	NotAfterLimit string
+
+	//WRPAC support
+	//Allow any EKU
+	AllowAnyEKU bool
+
 }
 
 // logInfo is used on the homepage and for /log.v3.json. The JSON schema is from
@@ -832,6 +837,8 @@ func main() {
 			NotAfterLimit:    notAfterLimit,
 			MarkCertificates: lc.CertificateProfile == "mark",
 			BlockedSPKIs:     blockedSPKIs,
+			AllowAnyEKU:      lc.AllowAnyEKU, // WRPAC
+
 		}
 
 		if time.Now().Format(time.DateOnly) == lc.Inception {
