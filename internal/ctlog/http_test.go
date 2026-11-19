@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -16,6 +17,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -405,6 +407,141 @@ func TestPrecertSigningCertificate(t *testing.T) {
 	// The same precertificate issued directly by the root is accepted.
 	precert = issue(precertTmpl, root, &leafKey.PublicKey, rootKey)
 	if rr := submit(precert, root); rr.Code != http.StatusOK {
+		t.Fatalf("got status %d, expected 200: %s", rr.Code, rr.Body)
+	}
+	tl.CheckLog(1)
+}
+
+func TestGetRoots(t *testing.T) {
+	rootsPEM := func(certs ...[]byte) []byte {
+		var buf bytes.Buffer
+		for _, cert := range certs {
+			fatalIfErr(t, pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: cert}))
+		}
+		return buf.Bytes()
+	}
+	expectRoots := func(tl *TestLog, expected ...[]byte) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		tl.Log.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/ct/v1/get-roots", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("got status %d, expected 200: %s", rr.Code, rr.Body)
+		}
+		var res struct {
+			Certificates [][]byte `json:"certificates"`
+		}
+		fatalIfErr(t, json.Unmarshal(rr.Body.Bytes(), &res))
+		if !slices.EqualFunc(res.Certificates, expected, bytes.Equal) {
+			t.Errorf("got %d roots, expected %d: %s", len(res.Certificates), len(expected), rr.Body)
+		}
+	}
+
+	tl := NewEmptyTestLog(t)
+	expectRoots(tl, testRoot)
+
+	fatalIfErr(t, tl.Log.SetRootsFromPEM(t.Context(), rootsPEM(testRoot, testIntermediate)))
+	expectRoots(tl, testRoot, testIntermediate)
+
+	// An update that fails to persist doesn't take effect.
+	backend := tl.Config.Backend.(*MemoryBackend)
+	backend.UploadCallback = func(key string, data []byte) (apply bool, err error) {
+		return false, errors.New("upload failed")
+	}
+	if err := tl.Log.SetRootsFromPEM(t.Context(), rootsPEM(testRoot)); err == nil {
+		t.Fatal("expected roots update to fail")
+	}
+	backend.UploadCallback = nil
+	expectRoots(tl, testRoot, testIntermediate)
+
+	// Roots with keys other than RSA or ECDSA are left out.
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	fatalIfErr(t, err)
+	edTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Test Ed25519 Root"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	edRoot, err := x509.CreateCertificate(rand.Reader, edTmpl, edTmpl, edKey.Public(), edKey)
+	fatalIfErr(t, err)
+	fatalIfErr(t, tl.Log.SetRootsFromPEM(t.Context(), rootsPEM(edRoot, testIntermediate)))
+	expectRoots(tl, testIntermediate)
+
+	// The roots are persisted and served again after a restart.
+	tl = ReloadLog(t, tl)
+	expectRoots(tl, testIntermediate)
+}
+
+func TestUnsupportedAlgorithms(t *testing.T) {
+	issue := func(tmpl, parent *x509.Certificate, pub, priv any) *x509.Certificate {
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, priv)
+		fatalIfErr(t, err)
+		cert, err := x509.ParseCertificate(der)
+		fatalIfErr(t, err)
+		return cert
+	}
+	caTmpl := func(name string) *x509.Certificate {
+		return &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: name},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(24 * time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "algorithms.example.com"},
+		DNSNames:     []string{"algorithms.example.com"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(12 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	fatalIfErr(t, err)
+	root := issue(caTmpl("Test Root"), caTmpl("Test Root"), &rootKey.PublicKey, rootKey)
+	_, edIntermediateKey, err := ed25519.GenerateKey(rand.Reader)
+	fatalIfErr(t, err)
+	edIntermediate := issue(caTmpl("Test Ed25519 Intermediate"), root, edIntermediateKey.Public(), rootKey)
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	fatalIfErr(t, err)
+	_, edLeafKey, err := ed25519.GenerateKey(rand.Reader)
+	fatalIfErr(t, err)
+
+	tl := NewEmptyTestLog(t)
+	fatalIfErr(t, tl.Log.SetRootsFromPEM(t.Context(),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw})))
+	expectRejected := func(chain ...*x509.Certificate) {
+		t.Helper()
+		var ders [][]byte
+		for _, c := range chain {
+			ders = append(ders, c.Raw)
+		}
+		rr := submitChain(t, tl, "192.0.2.1:1234", "test", ders)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("got status %d, expected 400: %s", rr.Code, rr.Body)
+		}
+		if !strings.Contains(rr.Body.String(), "unsupported key or signature algorithm in chain") {
+			t.Errorf("unexpected response body: %s", rr.Body)
+		}
+	}
+
+	// An Ed25519 leaf key with an ECDSA signature.
+	expectRejected(issue(leafTmpl, root, edLeafKey.Public(), rootKey), root)
+	// An ECDSA leaf key with an Ed25519 signature.
+	expectRejected(issue(leafTmpl, edIntermediate, &leafKey.PublicKey, edIntermediateKey), edIntermediate, root)
+	fatalIfErr(t, tl.Log.Sequence())
+	tl.CheckLog(0)
+
+	leaf := issue(leafTmpl, root, &leafKey.PublicKey, rootKey)
+	if rr := submitChain(t, tl, "192.0.2.1:1234", "test", [][]byte{leaf.Raw, root.Raw}); rr.Code != http.StatusOK {
 		t.Fatalf("got status %d, expected 200: %s", rr.Code, rr.Body)
 	}
 	tl.CheckLog(1)

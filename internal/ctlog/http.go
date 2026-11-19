@@ -254,6 +254,9 @@ func (l *Log) addChainOrPreChain(ctx context.Context, reqBody io.ReadCloser, use
 		e.IssuerKeyHash = sha256.Sum256(chain[1].RawSubjectPublicKeyInfo)
 	}
 	for _, c := range chain {
+		if !rsaOrECDSA(c) {
+			return nil, http.StatusBadRequest, fmtErrorf("unsupported key or signature algorithm in chain: %s", x509util.NameToString(c.Subject))
+		}
 		if slices.Contains(l.c.BlockedSPKIs, sha256.Sum256(c.RawSubjectPublicKeyInfo)) {
 			return nil, http.StatusBadRequest, fmtErrorf("blocked key in chain: %s", x509util.NameToString(c.Subject))
 		}
@@ -329,6 +332,26 @@ func (l *Log) addChainOrPreChain(ctx context.Context, reqBody io.ReadCloser, use
 	return rsp, http.StatusOK, nil
 }
 
+// rsaOrECDSA reports whether the certificate has an RSA or ECDSA public key and
+// is signed with RSA or ECDSA. The Chrome CT Log Policy requires logs to accept
+// no other roots and to reject chains including any other certificate.
+func rsaOrECDSA(c *x509.Certificate) bool {
+	switch c.PublicKeyAlgorithm {
+	case x509.RSA, x509.ECDSA:
+	default:
+		return false
+	}
+	switch c.SignatureAlgorithm {
+	case x509.MD2WithRSA, x509.MD5WithRSA, x509.SHA1WithRSA,
+		x509.SHA256WithRSA, x509.SHA384WithRSA, x509.SHA512WithRSA,
+		x509.SHA256WithRSAPSS, x509.SHA384WithRSAPSS, x509.SHA512WithRSAPSS,
+		x509.ECDSAWithSHA1, x509.ECDSAWithSHA256, x509.ECDSAWithSHA384, x509.ECDSAWithSHA512:
+		return true
+	default:
+		return false
+	}
+}
+
 func lowPriorityLeaf(c *x509.Certificate) bool {
 	if isPrecert, _ := ctfe.IsPrecertificate(c); isPrecert {
 		// The BRs allow at most 48 hours of backdating. A precertificate older
@@ -343,18 +366,9 @@ func lowPriorityLeaf(c *x509.Certificate) bool {
 }
 
 func (l *Log) getRoots(rw http.ResponseWriter, r *http.Request) {
-	roots := l.rootPool().RawCertificates()
-	var res struct {
-		Certificates [][]byte `json:"certificates"`
-	}
-	res.Certificates = make([][]byte, 0, len(roots))
-	for _, r := range roots {
-		res.Certificates = append(res.Certificates, r.Raw)
-	}
-
 	rw.Header().Set("Access-Control-Allow-Origin", "*")
 	rw.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(rw).Encode(res); err != nil {
+	if _, err := rw.Write(l.rootsResponse()); err != nil {
 		l.c.Log.DebugContext(r.Context(), "failed to write get-roots response", "err", err)
 	}
 }

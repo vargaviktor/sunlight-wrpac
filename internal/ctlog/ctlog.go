@@ -78,11 +78,13 @@ type Log struct {
 	issuersMu sync.RWMutex
 	issuers   map[[32]byte]bool
 
-	// roots are the trusted roots, and are always modified by swapping, so the
-	// pointer can be used without holding rootsMu after being obtained.
-	rootsMu  sync.RWMutex
-	roots    *x509util.PEMCertPool
-	rootsPEM []byte
+	// roots, rootsPEM, and rootsJSON are immutable snapshots of the trusted
+	// roots. They are swapped together under rootsMu and can be used without
+	// holding the lock after being obtained.
+	rootsMu   sync.RWMutex
+	roots     *x509util.PEMCertPool
+	rootsPEM  []byte
+	rootsJSON []byte
 
 	// sourceLimiter limits how many low-priority submissions of entries that
 	// are already in the log a single source (an IPv4 address or an IPv6 /64)
@@ -330,15 +332,19 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		config.Log.DebugContext(ctx, "edge tile", "tile", t)
 	}
 
-	roots := x509util.NewPEMCertPool()
 	rootsPEM, err := config.Backend.Fetch(ctx, "_roots.pem")
 	if err != nil {
 		config.Log.WarnContext(ctx, "failed to fetch previously trusted roots", "err", err)
-	} else if len(rootsPEM) > 0 {
-		if !roots.AppendCertsFromPEM(rootsPEM) {
-			config.Log.WarnContext(ctx, "failed to parse previously trusted roots",
-				"roots", string(rootsPEM))
-		}
+	}
+	roots, ok := parseRoots(ctx, config.Log, rootsPEM)
+	if !ok && len(rootsPEM) > 0 {
+		config.Log.WarnContext(ctx, "failed to parse previously trusted roots",
+			"roots", string(rootsPEM))
+	}
+
+	rootsJSON, err := marshalRoots(roots)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't encode roots: %w", err)
 	}
 
 	config.Log.InfoContext(ctx, "loaded log", "logID", base64.StdEncoding.EncodeToString(logID[:]),
@@ -376,6 +382,7 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		issuers:        make(map[[32]byte]bool),
 		roots:          roots,
 		rootsPEM:       rootsPEM,
+		rootsJSON:      rootsJSON,
 	}, nil
 }
 
@@ -447,13 +454,23 @@ func (l *Log) RootsPEM() []byte {
 	return l.rootsPEM
 }
 
+func (l *Log) rootsResponse() []byte {
+	l.rootsMu.RLock()
+	defer l.rootsMu.RUnlock()
+	return l.rootsJSON
+}
+
 func (l *Log) SetRootsFromPEM(ctx context.Context, pemBytes []byte) error {
 	if bytes.Equal(pemBytes, l.RootsPEM()) {
 		return nil
 	}
-	roots := x509util.NewPEMCertPool()
-	if !roots.AppendCertsFromPEM(pemBytes) {
+	roots, ok := parseRoots(ctx, l.c.Log, pemBytes)
+	if !ok {
 		return errors.New("failed to parse the PEM root certificates")
+	}
+	rootsJSON, err := marshalRoots(roots)
+	if err != nil {
+		return fmt.Errorf("couldn't encode roots: %w", err)
 	}
 	l.rootsMu.Lock()
 	defer l.rootsMu.Unlock()
@@ -463,7 +480,37 @@ func (l *Log) SetRootsFromPEM(ctx context.Context, pemBytes []byte) error {
 	l.m.ConfigRoots.Set(float64(len(roots.RawCertificates())))
 	l.roots = roots
 	l.rootsPEM = bytes.Clone(pemBytes)
+	l.rootsJSON = rootsJSON
 	return nil
+}
+
+// parseRoots parses PEM-encoded root certificates like AppendCertsFromPEM,
+// leaving out the ones that don't satisfy rsaOrECDSA.
+func parseRoots(ctx context.Context, log *slog.Logger, pemBytes []byte) (roots *x509util.PEMCertPool, ok bool) {
+	all := x509util.NewPEMCertPool()
+	ok = all.AppendCertsFromPEM(pemBytes)
+	roots = x509util.NewPEMCertPool()
+	for _, c := range all.RawCertificates() {
+		if !rsaOrECDSA(c) {
+			log.WarnContext(ctx, "ignoring root with unsupported key or signature algorithm",
+				"subject", x509util.NameToString(c.Subject))
+			continue
+		}
+		roots.AddCert(c)
+	}
+	return roots, ok
+}
+
+func marshalRoots(pool *x509util.PEMCertPool) ([]byte, error) {
+	roots := pool.RawCertificates()
+	var res struct {
+		Certificates [][]byte `json:"certificates"`
+	}
+	res.Certificates = make([][]byte, 0, len(roots))
+	for _, r := range roots {
+		res.Certificates = append(res.Certificates, r.Raw)
+	}
+	return json.Marshal(res)
 }
 
 // ReadOnlyAfter is how long after the end of the shard window
